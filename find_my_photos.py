@@ -1,272 +1,343 @@
-
-
-#-------------------------------------------------------------------------------------------------------------------
-
-''' Welcome To Photo Sorter!!! '''
-
 import cv2
 import face_recognition
 import os
 import shutil
-import re # For sanitizing phone number for folder name
-import uuid # For unique selfie filenames
+import re
+import uuid
+import numpy as np
+import time
+import gradio as gr # <-- Import Gradio
+from PIL import Image # <-- To handle image objects from Gradio
 
-# --- Configuration ---
-SOURCE_PHOTOS_DIR = "all_photos"  # Directory with all photos to search
-USER_SELFIE_STORAGE_DIR = "user_selfies" # Optional: where to save user selfies
-OUTPUT_BASE_DIR = "sorted_user_photos" # Base directory for storing sorted photos
-UNKNOWN_FACE_DIR_NAME = "unknown_user" # Fallback directory name
+# --- Configuration (remains the same) ---
+SOURCE_PHOTOS_DIR = "all_photos"
+USER_SELFIE_STORAGE_DIR = "user_selfies" # Gradio might save uploaded selfies here too
+OUTPUT_BASE_DIR = "sorted_user_photos"
+UNKNOWN_FACE_DIR_NAME = "unknown_user"
+ENCODINGS_FILE_PATH = "known_faces_encodings.npz"
 
-# Ensure base directories exist
+# Ensure base directories exist (Gradio might run from a different working dir, ensure these are created)
+# It's good practice for these paths to be absolute or resolved at runtime if the script's location is variable.
+# For simplicity, we assume they are relative to where the script is run.
 os.makedirs(SOURCE_PHOTOS_DIR, exist_ok=True)
 os.makedirs(USER_SELFIE_STORAGE_DIR, exist_ok=True)
 os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
 
 def sanitize_foldername(name):
-    """Removes or replaces characters not suitable for folder names."""
-    name = re.sub(r'[^\w\s-]', '', name).strip() # Keep alphanumeric, spaces, hyphens
-    name = re.sub(r'[-\s]+', '-', name) # Replace spaces/multiple hyphens with single hyphen
+    name = re.sub(r'[^\w\s-]', '', name).strip()
+    name = re.sub(r'[-\s]+', '-', name)
     return name if name else UNKNOWN_FACE_DIR_NAME
 
-def get_phone_number():
-    """Prompts the user for their phone number."""
-    while True:
-        phone = input("Please enter your phone number: ").strip()
-        if phone: # Basic check, can be improved with regex for phone format
-            return phone
-        else:
-            print("Phone number cannot be empty. Please try again.")
+def validate_phone_number(phone):
+    """Validates phone number: must be 10 digits."""
+    if phone.isdigit() and len(phone) == 10:
+        return True, ""
+    return False, "Invalid phone number. Must be exactly 10 digits."
 
-def capture_selfie_from_webcam(phone_number_sanitized):
-    """Captures a selfie from the webcam."""
-    cap = cv2.VideoCapture(0) # 0 is usually the default webcam
-    if not cap.isOpened():
-        print("Error: Could not open webcam.")
-        return None
+def validate_email_address(email):
+    """Validates email address format."""
+    email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if email and re.match(email_regex, email):
+        return True, ""
+    return False, "Invalid email format (e.g., user@example.com)."
 
-    print("\nWebcam activated. Press 's' to save the selfie, or 'q' to quit.")
-    selfie_path = None
-    unique_id = uuid.uuid4().hex[:8] # short unique id
-    filename = f"selfie_{phone_number_sanitized}_{unique_id}.jpg"
-    selfie_save_path = os.path.join(USER_SELFIE_STORAGE_DIR, filename)
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Can't receive frame (stream end?). Exiting ...")
-            break
-
-        # Display the resulting frame
-        cv2.imshow('Press "s" to save selfie, "q" to quit', frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('s'):
-            try:
-                cv2.imwrite(selfie_save_path, frame)
-                print(f"Selfie saved as {selfie_save_path}")
-                selfie_path = selfie_save_path
-                break
-            except Exception as e:
-                print(f"Error saving selfie: {e}")
-                selfie_path = None # Ensure it's None if save fails
-                break
-        elif key == ord('q'):
-            print("Selfie capture cancelled.")
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-    return selfie_path
-
-
-def get_selfie():
-    """Asks user to upload a selfie or capture one."""
-    while True:
-        choice = input("How would you like to provide your selfie?\n"
-                       "1. Upload an existing photo file\n"
-                       "2. Capture a new one from webcam\n"
-                       "Enter choice (1 or 2): ").strip()
-        if choice == '1':
-            selfie_path = input("Enter the full path to your selfie image: ").strip()
-            if os.path.isfile(selfie_path):
-                # Optionally, copy the uploaded selfie to our storage
-                try:
-                    filename = f"uploaded_selfie_{uuid.uuid4().hex[:8]}{os.path.splitext(selfie_path)[1]}"
-                    stored_selfie_path = os.path.join(USER_SELFIE_STORAGE_DIR, filename)
-                    shutil.copy(selfie_path, stored_selfie_path)
-                    print(f"Selfie copied to {stored_selfie_path}")
-                    return stored_selfie_path # Return the path of the copied selfie
-                except Exception as e:
-                    print(f"Error copying selfie: {e}. Using original path.")
-                    return selfie_path # Fallback to original path if copy fails
-            else:
-                print("Invalid file path. Please try again.")
-        elif choice == '2':
-            # We need a temporary identifier for the selfie name if captured before phone number
-            # Or we can ask for phone number first. Let's assume phone number is asked first.
-            # For this example, phone_number will be passed if needed for filename
-            # but capture_selfie_from_webcam handles its own naming now.
-            print("Preparing webcam...")
-            return capture_selfie_from_webcam("temp_user") # "temp_user" or pass actual phone
-        else:
-            print("Invalid choice. Please enter 1 or 2.")
-
-
-def load_and_encode_face(image_path):
-    """Loads an image, finds the first face, and returns its encoding."""
+def load_and_encode_face(image_input, is_path=True):
+    """
+    Loads an image from a path or uses a PIL Image object,
+    finds the first face, and returns its encoding.
+    """
     try:
-        print(f"Loading and encoding face from: {image_path}")
-        image = face_recognition.load_image_file(image_path)
-        face_encodings = face_recognition.face_encodings(image)
+        if is_path:
+            # print(f"Loading and encoding face from path: {image_input}") # Console log
+            image = face_recognition.load_image_file(image_input)
+        else: # image_input is a PIL Image object
+            # print(f"Encoding face from PIL Image object.") # Console log
+            image = np.array(image_input.convert('RGB')) # Ensure RGB
 
-        if face_encodings:
-            return face_encodings[0]  # Use the first face found
+        face_encodings_list = face_recognition.face_encodings(image)
+
+        if face_encodings_list:
+            return face_encodings_list[0]
         else:
-            print(f"Warning: No faces found in {image_path}")
+            print(f"Warning: No faces found in the provided selfie.")
             return None
     except Exception as e:
-        print(f"Error processing image {image_path}: {e}")
+        print(f"Error processing selfie image: {e}")
         return None
 
-def find_matching_photos(selfie_encoding, source_dir):
-    """
-    Scans photos in source_dir, compares them with selfie_encoding,
-    and returns a list of paths to matching photos.
-    """
-    if selfie_encoding is None:
-        return []
-
-    matched_photo_paths = []
-    print(f"\nScanning photos in {source_dir}...")
+def generate_and_save_known_encodings(source_dir, encodings_file_path):
+    # print(f"Generating and saving new encodings from {source_dir} to {encodings_file_path}...") # Console log
+    known_encodings = []
+    known_filenames = []
+    files_processed = 0
+    skipped_files = 0
+    start_time = time.time()
+    
+    # Progress tracking for Gradio (optional, more advanced for real-time updates)
+    # For now, we'll just return a summary message.
 
     for filename in os.listdir(source_dir):
         if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
             image_path = os.path.join(source_dir, filename)
-            print(f"  Checking: {filename}")
-
-            # It's more efficient to load image and get encodings once
             try:
-                unknown_image = face_recognition.load_image_file(image_path)
-                unknown_encodings = face_recognition.face_encodings(unknown_image)
-
-                if not unknown_encodings:
-                    # print(f"    No faces found in {filename}. Skipping.")
-                    continue
-
-                # Compare each face found in the unknown image with the selfie encoding
-                for unknown_encoding in unknown_encodings:
-                    match = face_recognition.compare_faces([selfie_encoding], unknown_encoding, tolerance=0.6) # Adjust tolerance as needed
-                    if match[0]: # compare_faces returns a list of booleans
-                        print(f"    MATCH FOUND: {filename}")
-                        matched_photo_paths.append(image_path)
-                        break # Move to next image once a match is found in this one
-            except FileNotFoundError:
-                print(f"    Error: File not found {image_path}. Skipping.")
+                image = face_recognition.load_image_file(image_path)
+                current_image_encodings = face_recognition.face_encodings(image)
+                
+                for encoding in current_image_encodings:
+                    known_encodings.append(encoding)
+                    known_filenames.append(filename) 
+                
+                # if not current_image_encodings:
+                    # print(f"    No faces found in {filename}.") # Console log
+                files_processed += 1
             except Exception as e:
-                print(f"    Error processing {filename}: {e}. Skipping.")
+                print(f"    Error processing {filename} for encoding: {e}. Skipping.")
+                skipped_files +=1
+    
+    if known_encodings:
+        np.savez_compressed(encodings_file_path, encodings=np.array(known_encodings), filenames=np.array(known_filenames))
+        end_time = time.time()
+        msg = (f"Encoding Generation Complete: Successfully generated {len(known_encodings)} face encodings "
+               f"from {files_processed} images ({skipped_files} skipped) in {end_time - start_time:.2f} seconds. "
+               f"Encodings saved to {os.path.basename(encodings_file_path)}.")
+        print(msg) # Console log
+        return known_encodings, known_filenames, msg
+    else:
+        msg = "Encoding Generation: No encodings were generated. Source directory might be empty, no faces found, or all files had errors."
+        print(msg) # Console log
+        # Save an empty file to avoid re-scanning empty/problematic dirs constantly if file didn't exist
+        np.savez_compressed(encodings_file_path, encodings=np.array([]), filenames=np.array([]))
+        return [], [], msg
+
+def load_known_encodings(encodings_file_path):
+    try:
+        data = np.load(encodings_file_path, allow_pickle=True) 
+        if data['encodings'].size == 0 and data['filenames'].size == 0 :
+             msg = f"Loaded encoding file '{os.path.basename(encodings_file_path)}' is empty (no faces previously found or empty source dir)."
+             # print(msg) # Console log
+             return [],[], msg
+        encodings = list(data['encodings']) if data['encodings'].size > 0 else []
+        filenames = list(data['filenames']) if data['filenames'].size > 0 else []
+        msg = f"Successfully loaded {len(encodings)} known face encodings from {os.path.basename(encodings_file_path)}."
+        # print(msg) # Console log
+        return encodings, filenames, msg
+    except FileNotFoundError:
+        msg = f"Encodings file '{os.path.basename(encodings_file_path)}' not found. Will proceed to generate if 'Force Rescan' is chosen or if it's the first run."
+        # print(msg) # Console log
+        return None, None, msg
+    except Exception as e:
+        msg = f"Error loading encodings from {os.path.basename(encodings_file_path)}: {e}. Will proceed to generate if 'Force Rescan' is chosen."
+        print(f"Error loading encodings: {e}") # Console log
+        return None, None, msg
+
+def find_matching_photos(selfie_encoding, all_known_encodings, all_known_filenames, source_image_dir):
+    if selfie_encoding is None or not all_known_encodings:
+        return []
+    matched_photo_filenames = set() 
+    # print(f"\nComparing selfie with {len(all_known_encodings)} known faces...") # Console log
+    start_time = time.time()
+    # Ensure all_known_encodings is a list of numpy arrays
+    # np.savez_compressed already saves them as numpy arrays, and list() conversion is fine.
+    matches_array = face_recognition.compare_faces(all_known_encodings, selfie_encoding, tolerance=0.6)
+    for i, match in enumerate(matches_array):
+        if match:
+            matched_photo_filenames.add(all_known_filenames[i])
+    end_time = time.time()
+    # print(f"Comparison completed in {end_time - start_time:.2f} seconds.") # Console log
+    matched_photo_paths = [os.path.join(source_image_dir, fname) for fname in matched_photo_filenames]
     return matched_photo_paths
 
 def create_user_folder_and_copy_photos(user_identifier, matched_photos, base_output_dir):
-    """Creates a user-specific folder and copies matched photos into it."""
     user_folder_name = sanitize_foldername(user_identifier)
     user_specific_dir = os.path.join(base_output_dir, user_folder_name)
-
+    # Ensure the user-specific directory is clean if it already exists, or handle as needed
+    if os.path.exists(user_specific_dir):
+        shutil.rmtree(user_specific_dir) # Remove old results for this user for this session
     os.makedirs(user_specific_dir, exist_ok=True)
-    print(f"\nCreating folder for you at: {user_specific_dir}")
-
+    
+    copied_files_paths = []
     copied_count = 0
+    if not matched_photos: # Ensure matched_photos is not None
+        matched_photos = []
+
     for photo_path in matched_photos:
         try:
-            shutil.copy(photo_path, user_specific_dir)
+            filename = os.path.basename(photo_path)
+            destination_path = os.path.join(user_specific_dir, filename)
+            shutil.copy(photo_path, destination_path)
+            copied_files_paths.append(destination_path) 
             copied_count += 1
-            # print(f"  Copied: {os.path.basename(photo_path)}")
         except Exception as e:
-            print(f"  Error copying {os.path.basename(photo_path)}: {e}")
-
+            print(f"  Error copying {os.path.basename(photo_path)}: {e}") # Console log
+    
     if copied_count > 0:
-        print(f"\nSuccessfully copied {copied_count} matched photos to {user_specific_dir}")
+        msg = f"Successfully copied {copied_count} matched photos to folder: '{user_folder_name}'"
     else:
-        print(f"\nNo photos were copied to {user_specific_dir} (either no matches or copy errors).")
-    return user_specific_dir
+        msg = f"No photos were copied to '{user_folder_name}' (no matches found or copy errors)."
+    # print(msg) # Console log
+    return msg, user_specific_dir, copied_files_paths
 
-def main():
-    """Main function to orchestrate the process."""
-    print("Welcome to the Photo Finder Service!")
-    print("------------------------------------")
+# --- Main function for Gradio Interface ---
+def process_request_gradio(phone_number, email_address, selfie_pil_image, force_rescan_encodings):
+    """
+    This function will be called by Gradio.
+    It takes user inputs from the UI and returns outputs to be displayed.
+    """
+    # Initialize outputs for Gradio in case of early return
+    final_status_message = "An unexpected error occurred."
+    gallery_output = []
+    zip_file_output = None
+    
+    status_messages = ["Process started..."]
 
-    # 1. Get phone number
-    phone_number = get_phone_number()
-    sanitized_phone_for_folder = sanitize_foldername(phone_number) # For folder naming
+    # 1. Validate Inputs
+    is_phone_valid, phone_error_msg = validate_phone_number(phone_number)
+    if not is_phone_valid:
+        return phone_error_msg, None, None 
 
-    # 2. Get user selfie
-    print("\n--- Selfie Time! ---")
-    selfie_path = None
-    while selfie_path is None: # Loop until a valid selfie is provided or captured
-        selfie_input_mode = input("How would you like to provide your selfie?\n"
-                                  "1. Upload an existing photo file\n"
-                                  "2. Capture a new one from webcam\n"
-                                  "Enter choice (1 or 2): ").strip()
-        if selfie_input_mode == '1':
-            temp_path = input("Enter the full path to your selfie image: ").strip()
-            if os.path.isfile(temp_path):
-                # Store the uploaded selfie with a unique name
-                try:
-                    ext = os.path.splitext(temp_path)[1]
-                    if not ext: ext = ".jpg" # default extension if none
-                    filename = f"uploaded_selfie_{sanitized_phone_for_folder}_{uuid.uuid4().hex[:8]}{ext}"
-                    selfie_path = os.path.join(USER_SELFIE_STORAGE_DIR, filename)
-                    shutil.copy(temp_path, selfie_path)
-                    print(f"Selfie copied and stored as {selfie_path}")
-                except Exception as e:
-                    print(f"Error copying selfie: {e}. Please try again or check permissions.")
-                    selfie_path = None # Reset on error
-            else:
-                print("Invalid file path. Please try again.")
-        elif selfie_input_mode == '2':
-            print("Preparing webcam...")
-            selfie_path = capture_selfie_from_webcam(sanitized_phone_for_folder)
-            if not selfie_path:
-                print("Webcam capture failed or was cancelled. Please try again or choose another option.")
+    is_email_valid, email_error_msg = validate_email_address(email_address)
+    if not is_email_valid:
+        return email_error_msg, None, None
+
+    if selfie_pil_image is None:
+        return "ERROR: Please upload or capture a selfie.", None, None
+    
+    status_messages.append(f"Inputs Validated: Phone: {phone_number}, Email: {email_address}")
+
+    # 2. Handle Known Encodings (Load or Generate)
+    known_encodings, known_filenames, enc_msg = load_known_encodings(ENCODINGS_FILE_PATH)
+    status_messages.append(f"Encoding Status: {enc_msg}")
+
+    if force_rescan_encodings or known_encodings is None: # known_encodings is None if file not found or error
+        status_messages.append("Force Rescan active or no existing encodings found. Attempting to generate new encodings...")
+        if not os.path.exists(SOURCE_PHOTOS_DIR) or not os.listdir(SOURCE_PHOTOS_DIR):
+            msg = f"ERROR: Source photo directory '{SOURCE_PHOTOS_DIR}' is empty or does not exist. Cannot generate encodings."
+            status_messages.append(msg)
+            if known_encodings is None and not os.path.exists(ENCODINGS_FILE_PATH): # If file truly didn't exist, create an empty one
+                 np.savez_compressed(ENCODINGS_FILE_PATH, encodings=np.array([]), filenames=np.array([]))
+            known_encodings, known_filenames = [], [] # Ensure these are empty lists
+            return "\n".join(status_messages), None, None # Critical error, stop here
         else:
-            print("Invalid choice. Please enter 1 or 2.")
+            known_encodings, known_filenames, gen_msg = generate_and_save_known_encodings(SOURCE_PHOTOS_DIR, ENCODINGS_FILE_PATH)
+            status_messages.append(f"Encoding Generation: {gen_msg}")
+    
+    if not known_encodings: # Check after attempting load/generate
+        # This condition means either source dir was empty, no faces found, or some other error during encoding
+        status_messages.append(f"Warning: No face encodings available (source directory '{SOURCE_PHOTOS_DIR}' might be empty, no faces found, or errors occurred). Cannot perform matching.")
+        # Don't necessarily exit, as the messages above would indicate the problem.
+        # The find_matching_photos will return empty if known_encodings is empty.
 
-    if not selfie_path:
-        print("No selfie provided. Exiting program.")
-        return
-
-    # 3. Load and encode the selfie
-    print("\n--- Processing Selfie ---")
-    selfie_encoding = load_and_encode_face(selfie_path)
+    # 3. Process Selfie
+    status_messages.append("Processing selfie...")
+    selfie_encoding = load_and_encode_face(selfie_pil_image, is_path=False) 
 
     if selfie_encoding is None:
-        print("Could not process the selfie (no face found or error). Exiting.")
-        return
+        status_messages.append("ERROR: Could not process the selfie (no face found or error).")
+        return "\n".join(status_messages), None, None
+    status_messages.append("Selfie processed successfully.")
 
-    print("Selfie processed successfully.")
-
-    # 4. Find matching photos
-    print("\n--- Searching for Your Photos ---")
-    if not os.listdir(SOURCE_PHOTOS_DIR):
-        print(f"The source photo directory '{SOURCE_PHOTOS_DIR}' is empty. Please add photos to search.")
-        return
-
-    matched_photos = find_matching_photos(selfie_encoding, SOURCE_PHOTOS_DIR)
-
-    if not matched_photos:
-        print("\nNo matching photos found in our collection.")
+    # 4. Find Matching Photos
+    if not known_encodings: # If still no encodings (e.g., empty source dir from start)
+        status_messages.append("No known face encodings to compare against. No matches possible.")
+        matched_photo_paths = []
     else:
-        print(f"\nFound {len(matched_photos)} potential match(es).")
-        # 5. Create folder and copy photos
-        user_folder_path = create_user_folder_and_copy_photos(
-            sanitized_phone_for_folder,
-            matched_photos,
+        status_messages.append("Searching for your photos using stored encodings...")
+        matched_photo_paths = find_matching_photos(selfie_encoding, known_encodings, known_filenames, SOURCE_PHOTOS_DIR)
+
+    if not matched_photo_paths:
+        status_messages.append("No matching photos found in the collection for your selfie.")
+        # Gallery will be empty, no zip file
+        gallery_output = []
+        zip_file_output = None
+    else:
+        status_messages.append(f"Match Found: {len(matched_photo_paths)} photo(s) seem to contain a match.")
+
+        # 5. Create User Folder and Copy Photos
+        sanitized_phone = sanitize_foldername(phone_number)
+        copy_msg, user_specific_dir, copied_files_local_paths = create_user_folder_and_copy_photos(
+            sanitized_phone,
+            matched_photo_paths,
             OUTPUT_BASE_DIR
         )
-        print(f"\nAll your matched photos have been organized in: {user_folder_path}")
-        print("You can now access this folder on your computer.")
+        status_messages.append(f"File Copy: {copy_msg}")
+        gallery_output = copied_files_local_paths # Use the paths of copied files for the gallery
 
-    print("\n------------------------------------")
-    print("Thank you for using the Photo Finder Service!")
+        # 6. Create a ZIP file of the matched photos for download
+        if copied_files_local_paths:
+            try:
+                zip_base_name = os.path.join(OUTPUT_BASE_DIR, f"matched_photos_{sanitized_phone}_{uuid.uuid4().hex[:6]}") # Add uuid to avoid name clashes
+                # Ensure the directory to zip exists and is not empty
+                if os.path.exists(user_specific_dir) and os.listdir(user_specific_dir):
+                    shutil.make_archive(zip_base_name, 'zip', user_specific_dir)
+                    zip_file_output = f"{zip_base_name}.zip"
+                    status_messages.append(f"Download: Matched photos zipped for download.")
+                else:
+                    status_messages.append("Download: No files were available in the user directory to zip.")
+            except Exception as e:
+                status_messages.append(f"Download Error: Could not create ZIP file: {e}")
+                print(f"Error zipping: {e}") # Console log
+        else:
+            status_messages.append("Download: No copied files to zip.")
+            
+    final_status_message = "\n".join(status_messages)
+    return final_status_message, gallery_output, zip_file_output
 
+
+# --- Define Gradio Interface ---
+inputs = [
+    gr.Textbox(label="Your 10-digit Phone Number", placeholder="e.g., 1234567890", info="Used for organizing your photos."),
+    gr.Textbox(label="Your Email Address", placeholder="e.g., user@example.com", info="Please provide your email."),
+    gr.Image(type="pil", label="Upload or Capture Your Selfie", sources=["upload", "webcam"], height=400),
+    gr.Checkbox(label="Force Rescan of Source Photo Encodings", info="Check this if new event photos have been added or if this is the very first run. This process can be slow depending on the number of source photos.")
+]
+
+outputs = [
+    gr.Textbox(label="Process Status & Messages", lines=10), # Increased lines for more messages
+    gr.Gallery(label="Matched Photos Preview", height=600, object_fit="contain", columns=5, preview=True),
+    gr.File(label="Download Matched Photos (ZIP file)")
+]
+
+description = (
+    "## Welcome to the Find My Photos Service!\n\n"
+    "1.  Enter your **10-digit phone number** and **email address**.\n"
+    "2.  **Upload a clear selfie** or use your webcam to capture one. You can crop/edit it after upload.\n"
+    "3.  Click **Submit**.\n\n"
+    "The system will then find photos of you from the event collection.\n\n"
+    "**Important Note for Admins/First Use:** If new event photos have been added to the system's `all_photos` folder, "
+    "or if this is the first time running the service with a new set of event photos, "
+    "please check the **'Force Rescan of Source Photo Encodings'** box. This initial scan and encoding process "
+    "can take several minutes depending on the number of photos. Subsequent runs (without 'Force Rescan') will be much faster."
+)
+
+article = (
+    "<div style='text-align: center; margin-top: 20px;'>"
+    "<p>Powered by Python, Gradio, and Face Recognition technology.</p>"
+    "<p><i>Please ensure your selfie is clear and well-lit for best results.</i></p>"
+    "</div>"
+)
+
+iface = gr.Interface(
+    fn=process_request_gradio,
+    inputs=inputs,
+    outputs=outputs,
+    title="📸 Find My Photos!",
+    description=description,
+    article=article,
+    allow_flagging='never',
+    theme=gr.themes.Soft() # Using a built-in theme
+)
+
+# --- To run the Gradio app ---
 if __name__ == "__main__":
-    main()
+    # Print some helpful paths for the user running the script
+    print("--- Application Paths ---")
+    print(f"Source photos are expected in: '{os.path.abspath(SOURCE_PHOTOS_DIR)}'")
+    print(f"User selfies (if saved from upload, though Gradio handles temp files) would be in: '{os.path.abspath(USER_SELFIE_STORAGE_DIR)}'")
+    print(f"Sorted photos and ZIP files will be saved in subdirectories of: '{os.path.abspath(OUTPUT_BASE_DIR)}'")
+    print(f"Pre-computed encodings file: '{os.path.abspath(ENCODINGS_FILE_PATH)}'")
+    print("-------------------------")
+    print("\nLaunching Gradio app... Access it locally via the URL printed below (usually http://127.0.0.1:7860 or similar).")
+    
+    # To make it accessible on your local network: iface.launch(server_name="0.0.0.0")
+    # To create a temporary public link (expires in 72 hours): iface.launch(share=True)
+    iface.launch(share=True)
